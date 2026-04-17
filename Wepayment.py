@@ -1,9 +1,9 @@
 import csv
-import json
 import os
 import time
 from datetime import datetime, timedelta
 
+import boto3
 import requests
 
 
@@ -21,15 +21,25 @@ currency = "BRL"
 BASE_URL = "https://api.wepayout.com.br/v1/payout/payments"
 
 # ---------------- DATE RANGE ---------------- #
-# Use local date boundaries and keep the range inclusive.
-start_date = "2026-04-08"
-end_date = "2026-04-15"
-# today = datetime.now().date()
-# past_date = today - timedelta(days=7)
+def get_date_range():
+    """
+    Prefer workflow-provided dates:
+      START_DATE=YYYY-MM-DD
+      END_DATE=YYYY-MM-DD
+    If they are not set, fall back to the last 7 days.
+    """
+    start = os.getenv("START_DATE")
+    end = os.getenv("END_DATE")
 
-# start_date = past_date.strftime("%Y-%m-%d")
-# end_date = today.strftime("%Y-%m-%d")
+    if start and end:
+        return start, end
 
+    today = datetime.now().date()
+    past_date = today - timedelta(days=7)
+    return past_date.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
+
+
+start_date, end_date = get_date_range()
 print(f"\nDate Filter Applied: {start_date} to {end_date}\n")
 
 
@@ -46,35 +56,36 @@ LONG_TIMEOUT_MERCHANTS = {
 MAX_RETRIES = 6
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
-CSV_FIELDS = [
-    "Merchant",
-    "WE ID",
-    "Invoice",
-    "Status",
-    "SubStatus",
-    "Created Date",
-    "Beneficiary",
-    "Beneficiary Document",
-    "Beneficiary Pix Key",
-    "Beneficiary Bank Code",
-    "Beneficiary Branch",
-    "Beneficiary Branch Digit",
-    "Beneficiary Account",
-    "Beneficiary Account Digit",
-    "Beneficiary Account Type",
-    "Amount",
-    "Payment Type",
-    "Currency Charged",
-    "Source Currency",
-    "Source Amount",
-    "Processed Amount",
-    "Updated Date",
-    "Description",
-    "Authentication",
-    "Rejected Reason",
-    "Payment Originator Legal Entity Name",
-    "Payment Originator Website",
-]
+# ---------------- CSV FIELD MAPPING (commented out — raw output used instead) ---------------- #
+# CSV_FIELDS = [
+#     "Merchant",
+#     "WE ID",
+#     "Invoice",
+#     "Status",
+#     "SubStatus",
+#     "Created Date",
+#     "Beneficiary",
+#     "Beneficiary Document",
+#     "Beneficiary Pix Key",
+#     "Beneficiary Bank Code",
+#     "Beneficiary Branch",
+#     "Beneficiary Branch Digit",
+#     "Beneficiary Account",
+#     "Beneficiary Account Digit",
+#     "Beneficiary Account Type",
+#     "Amount",
+#     "Payment Type",
+#     "Currency Charged",
+#     "Source Currency",
+#     "Source Amount",
+#     "Processed Amount",
+#     "Updated Date",
+#     "Description",
+#     "Authentication",
+#     "Rejected Reason",
+#     "Payment Originator Legal Entity Name",
+#     "Payment Originator Website",
+# ]
 
 
 def extract_payments(payload):
@@ -145,22 +156,142 @@ def normalize_amount(value):
     return text.strip()
 
 
-def build_csv_row(payment):
-    merchant = payment.get("merchant") or {}
-    beneficiary = payment.get("beneficiary") or {}
-    status = payment.get("status") or {}
+# ---------------- FIELD MAPPING (commented out — raw output used instead) ---------------- #
+# def build_csv_row(payment):
+#     merchant = payment.get("merchant") or {}
+#     beneficiary = payment.get("beneficiary") or {}
+#     status = payment.get("status") or {}
+#     amount = normalize_amount(payment.get("amount"))
+#     source_amount = normalize_amount(payment.get("source_amount"))
+#     processed_amount = source_amount or amount
+#     return {
+#         "Merchant": merchant.get("name", ""),
+#         "WE ID": payment.get("id", ""),
+#         "Invoice": payment.get("custom_code", ""),
+#         "Status": status.get("name", ""),
+#         "SubStatus": payment.get("sub_status", "") or payment.get("substatus", ""),
+#         "Created Date": parse_api_datetime(payment.get("created_at")),
+#         "Beneficiary": beneficiary.get("name", ""),
+#         "Beneficiary Document": beneficiary.get("document", ""),
+#         "Beneficiary Pix Key": beneficiary.get("pix_key", ""),
+#         "Beneficiary Bank Code": beneficiary.get("bank_code", ""),
+#         "Beneficiary Branch": beneficiary.get("bank_branch", ""),
+#         "Beneficiary Branch Digit": beneficiary.get("bank_branch_digit", ""),
+#         "Beneficiary Account": beneficiary.get("account", ""),
+#         "Beneficiary Account Digit": beneficiary.get("account_digit", ""),
+#         "Beneficiary Account Type": beneficiary.get("account_type", ""),
+#         "Amount": amount,
+#         "Payment Type": payment.get("payment_type", ""),
+#         "Currency Charged": payment.get("currency", ""),
+#         "Source Currency": payment.get("source_currency", ""),
+#         "Source Amount": source_amount,
+#         "Processed Amount": processed_amount,
+#         "Updated Date": parse_api_datetime(payment.get("updated_at")),
+#         "Description": payment.get("description", "") or "",
+#         "Authentication": payment.get("authentication_code", ""),
+#         "Rejected Reason": payment.get("rejection_description", ""),
+#         "Payment Originator Legal Entity Name": "",
+#         "Payment Originator Website": "",
+#     }
+#
+# def save_csv(data, filename="payments_full_data.csv"):
+#     with open(filename, "w", newline="", encoding="utf-8-sig") as f:
+#         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+#         writer.writeheader()
+#         for payment in data:
+#             if isinstance(payment, dict):
+#                 writer.writerow(build_csv_row(payment))
 
-    amount = normalize_amount(payment.get("amount"))
-    source_amount = normalize_amount(payment.get("source_amount"))
+
+# ---------------- CSV OUTPUT ---------------- #
+CSV_PRIMARY_FIELDS = [
+    "Merchant",
+    "WE ID",
+    "Invoice",
+    "Status",
+    "SubStatus",
+    "Created Date",
+    "Beneficiary",
+    "Beneficiary Document",
+    "Beneficiary Pix Key",
+    "Beneficiary Bank Code",
+    "Beneficiary Branch",
+    "Beneficiary Branch Digit",
+    "Beneficiary Account",
+    "Beneficiary Account Digit",
+    "Beneficiary Account Type",
+    "Amount",
+    "Payment Type",
+    "Currency Charged",
+    "Source Currency",
+    "Source Amount",
+    "Processed Amount",
+    "Updated Date",
+    "Description",
+    "Authentication",
+    "Rejected Reason",
+    "Payment Originator Legal Entity Name",
+    "Payment Originator Website",
+]
+
+CSV_MAPPED_KEYS = {
+    "Merchant",
+    "WE ID",
+    "Invoice",
+    "Status",
+    "SubStatus",
+    "Created Date",
+    "Beneficiary",
+    "Beneficiary Document",
+    "Beneficiary Pix Key",
+    "Beneficiary Bank Code",
+    "Beneficiary Branch",
+    "Beneficiary Branch Digit",
+    "Beneficiary Account",
+    "Beneficiary Account Digit",
+    "Beneficiary Account Type",
+    "Amount",
+    "Payment Type",
+    "Currency Charged",
+    "Source Currency",
+    "Source Amount",
+    "Processed Amount",
+    "Updated Date",
+    "Description",
+    "Authentication",
+    "Rejected Reason",
+    "Payment Originator Legal Entity Name",
+    "Payment Originator Website",
+}
+
+
+def flatten_record(record):
+    """Flatten one level of nested dicts so every field lands in its own column."""
+    flat = {}
+    for key, value in record.items():
+        if isinstance(value, dict):
+            for sub_key, sub_value in value.items():
+                flat[f"{key}_{sub_key}"] = sub_value
+        else:
+            flat[key] = value
+    return flat
+
+
+def build_mapped_row(record):
+    merchant = record.get("merchant") or {}
+    beneficiary = record.get("beneficiary") or {}
+    status = record.get("status") or {}
+    amount = normalize_amount(record.get("amount"))
+    source_amount = normalize_amount(record.get("source_amount"))
     processed_amount = source_amount or amount
 
     return {
         "Merchant": merchant.get("name", ""),
-        "WE ID": payment.get("id", ""),
-        "Invoice": payment.get("custom_code", ""),
+        "WE ID": record.get("id", ""),
+        "Invoice": record.get("custom_code", ""),
         "Status": status.get("name", ""),
-        "SubStatus": payment.get("sub_status", "") or payment.get("substatus", ""),
-        "Created Date": parse_api_datetime(payment.get("created_at")),
+        "SubStatus": record.get("sub_status", "") or record.get("substatus", ""),
+        "Created Date": parse_api_datetime(record.get("created_at")),
         "Beneficiary": beneficiary.get("name", ""),
         "Beneficiary Document": beneficiary.get("document", ""),
         "Beneficiary Pix Key": beneficiary.get("pix_key", ""),
@@ -171,27 +302,83 @@ def build_csv_row(payment):
         "Beneficiary Account Digit": beneficiary.get("account_digit", ""),
         "Beneficiary Account Type": beneficiary.get("account_type", ""),
         "Amount": amount,
-        "Payment Type": payment.get("payment_type", ""),
-        "Currency Charged": payment.get("currency", ""),
-        "Source Currency": payment.get("source_currency", ""),
+        "Payment Type": record.get("payment_type", ""),
+        "Currency Charged": record.get("currency", ""),
+        "Source Currency": record.get("source_currency", ""),
         "Source Amount": source_amount,
         "Processed Amount": processed_amount,
-        "Updated Date": parse_api_datetime(payment.get("updated_at")),
-        "Description": payment.get("description", "") or "",
-        "Authentication": payment.get("authentication_code", ""),
-        "Rejected Reason": payment.get("rejection_description", ""),
+        "Updated Date": parse_api_datetime(record.get("updated_at")),
+        "Description": record.get("description", "") or "",
+        "Authentication": record.get("authentication_code", ""),
+        "Rejected Reason": record.get("rejection_description", ""),
         "Payment Originator Legal Entity Name": "",
         "Payment Originator Website": "",
     }
 
 
-def save_csv(data, filename="payments_full_data.csv"):
+def save_mapped_csv_with_extras(data, filename="payments_full_data.csv"):
+    if not data:
+        print("No data to write.")
+        return
+
+    rows = []
+    extra_keys = []
+    seen_extras = set()
+
+    for record in data:
+        if not isinstance(record, dict):
+            continue
+
+        flat_record = flatten_record(record)
+        mapped_row = build_mapped_row(record)
+
+        # Keep everything else as-is, but do not duplicate mapped columns.
+        extras = {
+            key: value
+            for key, value in flat_record.items()
+            if key not in CSV_MAPPED_KEYS
+        }
+
+        for key in extras:
+            if key not in seen_extras:
+                seen_extras.add(key)
+                extra_keys.append(key)
+
+        rows.append({**mapped_row, **extras})
+
+    fieldnames = CSV_PRIMARY_FIELDS + extra_keys
+
     with open(filename, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
-        for payment in data:
-            if isinstance(payment, dict):
-                writer.writerow(build_csv_row(payment))
+        writer.writerows(rows)
+
+    print(
+        f"CSV saved to {filename} "
+        f"({len(rows)} rows, {len(fieldnames)} columns)"
+    )
+
+
+# ---------------- S3 UPLOAD ---------------- #
+S3_BUCKET = os.getenv("S3_BUCKET", "payout-recon")
+S3_PREFIX = os.getenv("S3_PREFIX", "wepayments/payout/raw_daily")
+S3_KEY = os.getenv("S3_KEY", "")
+AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-1")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+
+
+def upload_csv_to_s3(local_path, date_str):
+    s3_key = S3_KEY or f"{S3_PREFIX}/{date_str}/payments_full_data.csv"
+    s3 = boto3.client(
+        "s3",
+        region_name=AWS_REGION,
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    )
+    print(f"\nUploading to s3://{S3_BUCKET}/{s3_key} ...")
+    s3.upload_file(local_path, S3_BUCKET, s3_key)
+    print(f"Upload complete: s3://{S3_BUCKET}/{s3_key}")
 
 
 def get_timeout_for_merchant(merchant_id):
@@ -307,10 +494,6 @@ def fetch_merchant_data_in_range(merchant_id, range_start, range_end):
         if not payments:
             break
 
-        for payment in payments:
-            if isinstance(payment, dict):
-                payment["merchantId"] = merchant_id
-
         all_data.extend(payments)
         print(f"Fetched {len(payments)} records")
 
@@ -388,16 +571,9 @@ if __name__ == "__main__":
 
     print(f"\nTotal Records (Date Filtered): {total_records}")
 
-    # Save output
-    with open("payments_full_data.json", "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    # Save raw CSV
+    csv_filename = "payments_full_data.csv"
+    save_mapped_csv_with_extras(data, csv_filename)
 
-    print("\nData saved to payments_full_data.json")
-
-    save_csv(data, "payments_full_data.csv")
-    print("Data saved to payments_full_data.csv")
-
-    # Show sample
-    print("\nSample Records:\n")
-    for record in data[:5]:
-        print(json.dumps(record, indent=2, ensure_ascii=False))
+    # Upload to S3 under the workflow date folder, unless S3_KEY overrides it.
+    upload_csv_to_s3(csv_filename, end_date)
