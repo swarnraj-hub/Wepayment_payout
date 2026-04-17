@@ -2,23 +2,31 @@ name: Run Wepayment Script
 
 on:
   workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Start Date"
+        required: true
+      end_date:
+        description: "End Date"
+        required: true
+      upload_s3:
+        description: "Upload to S3"
+        required: true
 
 jobs:
   run-script:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Install dependencies (optional)
+      - name: Run script
         run: |
-          pip install -r requirements.txt || true
-
-      - name: Run Python script
-        run: python Wepayment.py
+          python Wepayment.py \
+          "${{ github.event.inputs.start_date }}" \
+          "${{ github.event.inputs.end_date }}" \
+          "${{ github.event.inputs.upload_s3 }}"
