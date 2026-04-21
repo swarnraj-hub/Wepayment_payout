@@ -818,8 +818,15 @@ AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
 
 
+# Valid AWS region format: 2-3 lowercase words separated by hyphens, ending in a digit.
+import re as _re
+_AWS_REGION_RE = _re.compile(r'^[a-z]+-[a-z]+-[0-9]+$')
+
+
 def upload_csv_to_s3(local_path, date_str):
-    # --- Pre-flight: catch missing secrets before boto3 gives a cryptic error ---
+    # --- Pre-flight checks ---
+
+    # 1. Required secrets present
     missing = [name for name, val in [
         ("AWS_ACCESS_KEY_ID",     AWS_ACCESS_KEY_ID),
         ("AWS_SECRET_ACCESS_KEY", AWS_SECRET_ACCESS_KEY),
@@ -828,20 +835,28 @@ def upload_csv_to_s3(local_path, date_str):
     ] if not val]
     if missing:
         print(f"\nS3 upload SKIPPED — missing env vars: {', '.join(missing)}")
+        print("Set these as GitHub secrets: Settings -> Secrets -> Actions.")
         return
 
-    # Absolute path so boto3 always finds the file regardless of working directory.
+    # 2. Region format validation (catches typos like 'ap_southeast_1' or extra spaces)
+    region = AWS_REGION.strip()
+    if not _AWS_REGION_RE.match(region):
+        print(f"\nS3 upload SKIPPED — AWS_REGION value looks invalid: '{region}'")
+        print("Expected format: ap-southeast-1 / us-east-1 / eu-west-2 etc.")
+        return
+
+    # 3. File must exist on disk
     abs_path = os.path.abspath(local_path)
     if not os.path.exists(abs_path):
         print(f"\nS3 upload SKIPPED — file not found at: {abs_path}")
         return
 
     s3_key = S3_KEY or f"{S3_PREFIX}/{date_str}/payments_full_data.csv"
-    print(f"\nUploading {abs_path} -> s3://{S3_BUCKET}/{s3_key} (region: {AWS_REGION}) ...")
+    print(f"\nUploading {abs_path} -> s3://{S3_BUCKET}/{s3_key} (region: {region}) ...")
     try:
         s3 = boto3.client(
             "s3",
-            region_name=AWS_REGION,
+            region_name=region,
             aws_access_key_id=AWS_ACCESS_KEY_ID,
             aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
         )
@@ -849,7 +864,10 @@ def upload_csv_to_s3(local_path, date_str):
         print(f"Upload complete: s3://{S3_BUCKET}/{s3_key}")
     except Exception as e:
         print(f"\nS3 upload FAILED: {e}")
-        print("Check: bucket name, region, IAM permissions (s3:PutObject), and secret values.")
+        print("Checklist:")
+        print(f"  - Bucket '{S3_BUCKET}' exists in region '{region}'?")
+        print(f"  - IAM user has s3:PutObject on arn:aws:s3:::{S3_BUCKET}/*?")
+        print(f"  - AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are correct?")
         raise SystemExit(1)
 
 
@@ -1032,5 +1050,6 @@ if __name__ == "__main__":
         upload_csv_to_s3(csv_filename, end_date)
     else:
         print("\nS3 upload skipped (upload_s3=false).")
+
 
 
