@@ -655,6 +655,8 @@ LONG_TIMEOUT_MERCHANTS = {
 }
 MAX_RETRIES = 6
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+# 403 means bad credentials / no permission — retrying or falling back will never help.
+NON_RETRYABLE_STATUS_CODES = {401, 403}
 
 
 # ---------------- HELPERS ---------------- #
@@ -776,15 +778,11 @@ def build_mapped_row(record):
 
 
 def save_mapped_csv_with_extras(data, filename="payments_full_data.csv"):
-    if not data:
-        print("No data to write.")
-        return
-
     rows = []
     extra_keys = []
     seen_extras = set()
 
-    for record in data:
+    for record in (data or []):
         if not isinstance(record, dict):
             continue
         flat_record = flatten_record(record)
@@ -797,12 +795,18 @@ def save_mapped_csv_with_extras(data, filename="payments_full_data.csv"):
         rows.append({**mapped_row, **extras})
 
     fieldnames = CSV_PRIMARY_FIELDS + extra_keys
+
+    # Always write the file (even if empty) so downstream S3 upload never
+    # crashes with FileNotFoundError.
     with open(filename, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
-    print(f"CSV saved to {filename} ({len(rows)} rows, {len(fieldnames)} columns)")
+    if rows:
+        print(f"CSV saved to {filename} ({len(rows)} rows, {len(fieldnames)} columns)")
+    else:
+        print(f"No data returned — empty CSV (headers only) written to {filename}.")
 
 
 # ---------------- S3 UPLOAD ---------------- #
@@ -853,6 +857,12 @@ def fetch_page_with_retry(params, merchant_id):
                     return response.json(), None
                 except ValueError as e:
                     return None, f"Invalid JSON for merchant {merchant_id}: {e}"
+
+            if response.status_code in NON_RETRYABLE_STATUS_CODES:
+                return None, (
+                    f"HTTP {response.status_code} (auth/permission error) for merchant {merchant_id} — "
+                    f"check your WEPOUT_TOKEN secret. Response: {response.text[:300]}"
+                )
 
             if response.status_code in RETRYABLE_STATUS_CODES:
                 wait_seconds = min(2 ** (attempt - 1), 8)
@@ -945,6 +955,11 @@ def fetch_merchant_data(merchant_id):
     if error is None:
         return data
 
+    # Auth errors (401/403) will never succeed on retry — skip immediately.
+    if "auth/permission error" in (error or ""):
+        print(f"Skipping merchant {merchant_id} — permission denied (no daily fallback attempted).")
+        return []
+
     print(
         f"Broad range failed for merchant {merchant_id}: {error}\n"
         f"Falling back to daily chunks for {merchant_id}."
@@ -993,3 +1008,4 @@ if __name__ == "__main__":
         upload_csv_to_s3(csv_filename, end_date)
     else:
         print("\nS3 upload skipped (upload_s3=false).")
+
