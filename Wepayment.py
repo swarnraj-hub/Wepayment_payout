@@ -1000,6 +1000,25 @@ def fetch_range(merchant_id, range_start, range_end, hdrs):
     return all_data, None
 
 
+
+def discover_merchant_ids(hdrs, sample_start, sample_end):
+    """Try the API without merchant_id to find which merchants are accessible."""
+    print("
+[Discovery] Calling API without merchant_id filter...")
+    import requests as _req
+    params = {"currency": currency, "created_after": sample_start, "created_before": sample_end, "page": 1, "per_page": 100}
+    try:
+        resp = _req.get(BASE_URL, headers=hdrs, params=params, timeout=DEFAULT_TIMEOUT)
+        print(f"[Discovery] HTTP {resp.status_code}  Body: {resp.text[:500]}")
+        if resp.status_code == 200:
+            payments = extract_payments(resp.json())
+            ids = list(dict.fromkeys(p.get("merchant", {}).get("id") or p.get("merchant_id") for p in payments if p.get("merchant", {}).get("id") or p.get("merchant_id")))
+            print(f"[Discovery] {len(payments)} records found. Merchant IDs: {ids}")
+            return ids or None
+    except Exception as exc:
+        print(f"[Discovery] Exception: {exc}")
+    return None
+
 def fetch_merchant(merchant_id, start, end, hdrs):
     data, error = fetch_range(merchant_id, start, end, hdrs)
 
@@ -1067,13 +1086,23 @@ if __name__ == "__main__":
     print("=" * 60)
 
     if len(all_data) == 0:
-        print(
-            "\n  WARNING: Zero records fetched.\n"
-            "  Most likely cause: WEPOUT_TOKEN is expired or invalid.\n"
-            "  Action: GitHub -> Settings -> Secrets -> WEPOUT_TOKEN\n"
-            "          Refresh the token from your WEpayout dashboard.\n"
-        )
-
+        print("
+[Discovery] Zero records from hardcoded IDs. Probing API without merchant_id...")
+        disc = discover_merchant_ids(hdrs, start_date, end_date)
+        if disc:
+            print(f"
+[Discovery] Retrying with IDs from API: {disc}")
+            for mid in disc:
+                print(f"
+-- Merchant {mid} (discovered) --")
+                recs = fetch_merchant(mid, start_date, end_date, hdrs)
+                merchant_counts[mid] = len(recs)
+                all_data.extend(recs)
+            print(f"
+[Discovery] TOTAL: {len(all_data)} records after retry")
+        else:
+            print("
+  Auto-discovery returned nothing. Update merchant_ids list in Wepayment.py")
     # 4. Write CSV (always, even if empty)
     csv_path = os.path.abspath("payments_full_data.csv")
     print(f"\nWriting CSV -> {csv_path}")
