@@ -1008,7 +1008,7 @@ def fetch_merchant(merchant_id, start, end, hdrs):
 
     # Auth error — never recoverable
     if "AUTH_ERROR" in (error or ""):
-        print(f"  x Merchant {merchant_id}: permission denied — skipping.")
+        print(f"  x Merchant {merchant_id}: {error}")
         return []
 
     # Other error — try day-by-day
