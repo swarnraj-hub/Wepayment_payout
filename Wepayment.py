@@ -583,83 +583,122 @@
 
 import csv
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta
 
 import boto3
 import requests
+from botocore.exceptions import BotoCoreError, ClientError
 
 
-# ---------------- CONFIG ---------------- #
+# ═══════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════
 merchant_ids = [
     582, 585, 587, 780, 858, 841, 586, 785, 877, 969,
     801, 859, 803, 832, 938, 948, 953, 970, 978,
 ]
 
-# Prefer an environment variable so the token is not hard-coded.
-TOKEN = os.getenv("WEPOUT_TOKEN", "PASTE_YOUR_TOKEN_HERE")
+TOKEN    = os.getenv("WEPOUT_TOKEN", "")
 currency = "BRL"
-
 BASE_URL = "https://api.wepayout.com.br/v1/payout/payments"
 
+DEFAULT_TIMEOUT            = 60
+LONG_TIMEOUT_MERCHANTS     = {585: 180}
+MAX_RETRIES                = 6
+RETRYABLE_STATUS_CODES     = {429, 500, 502, 503, 504}
+NON_RETRYABLE_STATUS_CODES = {401, 403}
 
-# ---------------- DATE RANGE ---------------- #
+# S3 — NO hardcoded defaults for secrets (empty string = not set)
+S3_BUCKET             = os.getenv("S3_BUCKET", "")
+S3_PREFIX             = os.getenv("S3_PREFIX", "wepayments/payout/raw_daily")
+S3_KEY                = os.getenv("S3_KEY", "")
+AWS_REGION            = os.getenv("AWS_REGION", "")
+AWS_ACCESS_KEY_ID     = os.getenv("AWS_ACCESS_KEY_ID", "")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+
+_AWS_REGION_RE = re.compile(r"^[a-z]+-[a-z]+-[0-9]+$")
+
+
+# ═══════════════════════════════════════════════════════════
+# STARTUP VALIDATION
+# ═══════════════════════════════════════════════════════════
+def validate_config():
+    """Fail fast with a clear message if the API token is missing."""
+    if not TOKEN:
+        print("\n" + "=" * 60)
+        print("CONFIGURATION ERROR — script cannot run:")
+        print("  WEPOUT_TOKEN is not set.")
+        print("  Fix: GitHub repo -> Settings -> Secrets -> Actions")
+        print("       add WEPOUT_TOKEN with your WEpayout API token.")
+        print("=" * 60 + "\n")
+        raise SystemExit(1)
+
+
+def validate_s3_config():
+    """Returns a list of problem strings; empty list means all good."""
+    issues = []
+
+    missing = [name for name, val in [
+        ("AWS_ACCESS_KEY_ID",     AWS_ACCESS_KEY_ID),
+        ("AWS_SECRET_ACCESS_KEY", AWS_SECRET_ACCESS_KEY),
+        ("AWS_REGION",            AWS_REGION),
+        ("S3_BUCKET",             S3_BUCKET),
+    ] if not val]
+    if missing:
+        issues.append(
+            "Missing GitHub secrets: " + ", ".join(missing) + "\n"
+            "    Fix: Settings -> Secrets -> Actions -> add each one."
+        )
+
+    if AWS_REGION and not _AWS_REGION_RE.match(AWS_REGION.strip()):
+        issues.append(
+            f"AWS_REGION='{AWS_REGION}' is not valid.\n"
+            "    Expected format: ap-southeast-1 / us-east-1 / eu-west-2\n"
+            "    Common mistakes: underscores instead of hyphens, extra spaces, quotes."
+        )
+
+    return issues
+
+
+# ═══════════════════════════════════════════════════════════
+# DATE RANGE & FLAGS
+# ═══════════════════════════════════════════════════════════
 def get_date_range():
-    """
-    Priority order:
-      1. CLI args:  python Wepayment.py START_DATE END_DATE [upload_s3]
-      2. Env vars:  START_DATE / END_DATE
-      3. Fallback:  last 7 days
-    """
+    """Priority: CLI args -> env vars -> last 7 days."""
     if len(sys.argv) >= 3:
         return sys.argv[1], sys.argv[2]
-
     start = os.getenv("START_DATE")
-    end = os.getenv("END_DATE")
+    end   = os.getenv("END_DATE")
     if start and end:
         return start, end
-
     today = datetime.now().date()
-    past_date = today - timedelta(days=7)
-    return past_date.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
+    return (today - timedelta(days=7)).strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
 
 
 def should_upload_to_s3():
-    """
-    Honour the upload_s3 flag passed from the workflow (3rd CLI arg),
-    then fall back to the UPLOAD_S3 env var, then default to True.
-    Accepts: 'true' / 'false' (case-insensitive).
-    """
     if len(sys.argv) >= 4:
         return sys.argv[3].strip().lower() == "true"
     return os.getenv("UPLOAD_S3", "true").strip().lower() == "true"
 
 
-start_date, end_date = get_date_range()
-print(f"\nDate Filter Applied: {start_date} to {end_date}\n")
+# ═══════════════════════════════════════════════════════════
+# HEADERS  (built after token is validated)
+# ═══════════════════════════════════════════════════════════
+def build_headers():
+    return {
+        "Authorization": f"Bearer {TOKEN}",
+        "Accept":        "application/json",
+        "Content-Type":  "application/json",
+        "User-Agent":    "Mozilla/5.0",
+    }
 
 
-# ---------------- HEADERS ---------------- #
-# FIX: was `WEPOUT_TOKEN` (undefined name); must use the `TOKEN` variable.
-headers = {
-    "Authorization": f"Bearer {TOKEN}",
-    "Accept": "application/json",
-    "Content-Type": "application/json",
-    "User-Agent": "Mozilla/5.0",
-}
-
-DEFAULT_TIMEOUT = 60
-LONG_TIMEOUT_MERCHANTS = {
-    585: 180,
-}
-MAX_RETRIES = 6
-RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
-# 403 means bad credentials / no permission — retrying or falling back will never help.
-NON_RETRYABLE_STATUS_CODES = {401, 403}
-
-
-# ---------------- HELPERS ---------------- #
+# ═══════════════════════════════════════════════════════════
+# PARSING HELPERS
+# ═══════════════════════════════════════════════════════════
 def extract_payments(payload):
     if isinstance(payload, dict):
         if isinstance(payload.get("data"), list):
@@ -712,7 +751,9 @@ def normalize_amount(value):
     return text.strip()
 
 
-# ---------------- CSV OUTPUT ---------------- #
+# ═══════════════════════════════════════════════════════════
+# CSV
+# ═══════════════════════════════════════════════════════════
 CSV_PRIMARY_FIELDS = [
     "Merchant", "WE ID", "Invoice", "Status", "SubStatus", "Created Date",
     "Beneficiary", "Beneficiary Document", "Beneficiary Pix Key",
@@ -723,7 +764,6 @@ CSV_PRIMARY_FIELDS = [
     "Authentication", "Rejected Reason",
     "Payment Originator Legal Entity Name", "Payment Originator Website",
 ]
-
 CSV_MAPPED_KEYS = set(CSV_PRIMARY_FIELDS)
 
 
@@ -739,120 +779,96 @@ def flatten_record(record):
 
 
 def build_mapped_row(record):
-    merchant = record.get("merchant") or {}
+    merchant    = record.get("merchant")    or {}
     beneficiary = record.get("beneficiary") or {}
-    status = record.get("status") or {}
-    amount = normalize_amount(record.get("amount"))
-    source_amount = normalize_amount(record.get("source_amount"))
+    status      = record.get("status")      or {}
+    amount           = normalize_amount(record.get("amount"))
+    source_amount    = normalize_amount(record.get("source_amount"))
     processed_amount = source_amount or amount
 
     return {
-        "Merchant": merchant.get("name", ""),
-        "WE ID": record.get("id", ""),
-        "Invoice": record.get("custom_code", ""),
-        "Status": status.get("name", ""),
-        "SubStatus": record.get("sub_status", "") or record.get("substatus", ""),
-        "Created Date": parse_api_datetime(record.get("created_at")),
-        "Beneficiary": beneficiary.get("name", ""),
-        "Beneficiary Document": beneficiary.get("document", ""),
-        "Beneficiary Pix Key": beneficiary.get("pix_key", ""),
-        "Beneficiary Bank Code": beneficiary.get("bank_code", ""),
-        "Beneficiary Branch": beneficiary.get("bank_branch", ""),
-        "Beneficiary Branch Digit": beneficiary.get("bank_branch_digit", ""),
-        "Beneficiary Account": beneficiary.get("account", ""),
-        "Beneficiary Account Digit": beneficiary.get("account_digit", ""),
-        "Beneficiary Account Type": beneficiary.get("account_type", ""),
-        "Amount": amount,
-        "Payment Type": record.get("payment_type", ""),
-        "Currency Charged": record.get("currency", ""),
-        "Source Currency": record.get("source_currency", ""),
-        "Source Amount": source_amount,
-        "Processed Amount": processed_amount,
-        "Updated Date": parse_api_datetime(record.get("updated_at")),
-        "Description": record.get("description", "") or "",
-        "Authentication": record.get("authentication_code", ""),
-        "Rejected Reason": record.get("rejection_description", ""),
+        "Merchant":                             merchant.get("name", ""),
+        "WE ID":                                record.get("id", ""),
+        "Invoice":                              record.get("custom_code", ""),
+        "Status":                               status.get("name", ""),
+        "SubStatus":                            record.get("sub_status", "") or record.get("substatus", ""),
+        "Created Date":                         parse_api_datetime(record.get("created_at")),
+        "Beneficiary":                          beneficiary.get("name", ""),
+        "Beneficiary Document":                 beneficiary.get("document", ""),
+        "Beneficiary Pix Key":                  beneficiary.get("pix_key", ""),
+        "Beneficiary Bank Code":                beneficiary.get("bank_code", ""),
+        "Beneficiary Branch":                   beneficiary.get("bank_branch", ""),
+        "Beneficiary Branch Digit":             beneficiary.get("bank_branch_digit", ""),
+        "Beneficiary Account":                  beneficiary.get("account", ""),
+        "Beneficiary Account Digit":            beneficiary.get("account_digit", ""),
+        "Beneficiary Account Type":             beneficiary.get("account_type", ""),
+        "Amount":                               amount,
+        "Payment Type":                         record.get("payment_type", ""),
+        "Currency Charged":                     record.get("currency", ""),
+        "Source Currency":                      record.get("source_currency", ""),
+        "Source Amount":                        source_amount,
+        "Processed Amount":                     processed_amount,
+        "Updated Date":                         parse_api_datetime(record.get("updated_at")),
+        "Description":                          record.get("description", "") or "",
+        "Authentication":                       record.get("authentication_code", ""),
+        "Rejected Reason":                      record.get("rejection_description", ""),
         "Payment Originator Legal Entity Name": "",
-        "Payment Originator Website": "",
+        "Payment Originator Website":           "",
     }
 
 
-def save_mapped_csv_with_extras(data, filename="payments_full_data.csv"):
-    rows = []
-    extra_keys = []
+def save_csv(data, filename):
+    """Always writes the file (even header-only) so S3 upload never hits FileNotFoundError."""
+    rows        = []
+    extra_keys  = []
     seen_extras = set()
 
     for record in (data or []):
         if not isinstance(record, dict):
             continue
-        flat_record = flatten_record(record)
-        mapped_row = build_mapped_row(record)
-        extras = {k: v for k, v in flat_record.items() if k not in CSV_MAPPED_KEYS}
-        for key in extras:
-            if key not in seen_extras:
-                seen_extras.add(key)
-                extra_keys.append(key)
-        rows.append({**mapped_row, **extras})
+        flat   = flatten_record(record)
+        mapped = build_mapped_row(record)
+        extras = {k: v for k, v in flat.items() if k not in CSV_MAPPED_KEYS}
+        for k in extras:
+            if k not in seen_extras:
+                seen_extras.add(k)
+                extra_keys.append(k)
+        rows.append({**mapped, **extras})
 
     fieldnames = CSV_PRIMARY_FIELDS + extra_keys
-
-    # Always write the file (even if empty) so downstream S3 upload never
-    # crashes with FileNotFoundError.
     with open(filename, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
     if rows:
-        print(f"CSV saved to {filename} ({len(rows)} rows, {len(fieldnames)} columns)")
+        print(f"  CSV written: {filename}  ({len(rows)} rows, {len(fieldnames)} columns)")
     else:
-        print(f"No data returned — empty CSV (headers only) written to {filename}.")
+        print(f"  CSV written: {filename}  (headers only — no data fetched)")
 
 
-# ---------------- S3 UPLOAD ---------------- #
-S3_BUCKET = os.getenv("S3_BUCKET", "payout-recon")
-S3_PREFIX = os.getenv("S3_PREFIX", "wepayments/payout/raw_daily")
-S3_KEY = os.getenv("S3_KEY", "")
-AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-1")
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
-
-
-# Valid AWS region format: 2-3 lowercase words separated by hyphens, ending in a digit.
-import re as _re
-_AWS_REGION_RE = _re.compile(r'^[a-z]+-[a-z]+-[0-9]+$')
-
-
+# ═══════════════════════════════════════════════════════════
+# S3 UPLOAD
+# ═══════════════════════════════════════════════════════════
 def upload_csv_to_s3(local_path, date_str):
-    # --- Pre-flight checks ---
+    issues = validate_s3_config()
+    if issues:
+        print("\n" + "=" * 60)
+        print("S3 UPLOAD SKIPPED — fix these issues:")
+        for issue in issues:
+            print(f"  x {issue}")
+        print("=" * 60)
+        return False
 
-    # 1. Required secrets present
-    missing = [name for name, val in [
-        ("AWS_ACCESS_KEY_ID",     AWS_ACCESS_KEY_ID),
-        ("AWS_SECRET_ACCESS_KEY", AWS_SECRET_ACCESS_KEY),
-        ("AWS_REGION",            AWS_REGION),
-        ("S3_BUCKET",             S3_BUCKET),
-    ] if not val]
-    if missing:
-        print(f"\nS3 upload SKIPPED — missing env vars: {', '.join(missing)}")
-        print("Set these as GitHub secrets: Settings -> Secrets -> Actions.")
-        return
-
-    # 2. Region format validation (catches typos like 'ap_southeast_1' or extra spaces)
-    region = AWS_REGION.strip()
-    if not _AWS_REGION_RE.match(region):
-        print(f"\nS3 upload SKIPPED — AWS_REGION value looks invalid: '{region}'")
-        print("Expected format: ap-southeast-1 / us-east-1 / eu-west-2 etc.")
-        return
-
-    # 3. File must exist on disk
     abs_path = os.path.abspath(local_path)
     if not os.path.exists(abs_path):
-        print(f"\nS3 upload SKIPPED — file not found at: {abs_path}")
-        return
+        print(f"\nS3 upload SKIPPED — file not found: {abs_path}")
+        return False
 
+    region = AWS_REGION.strip()
     s3_key = S3_KEY or f"{S3_PREFIX}/{date_str}/payments_full_data.csv"
-    print(f"\nUploading {abs_path} -> s3://{S3_BUCKET}/{s3_key} (region: {region}) ...")
+    print(f"\nUploading to s3://{S3_BUCKET}/{s3_key}  (region: {region}) ...")
+
     try:
         s3 = boto3.client(
             "s3",
@@ -861,37 +877,46 @@ def upload_csv_to_s3(local_path, date_str):
             aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
         )
         s3.upload_file(abs_path, S3_BUCKET, s3_key)
-        print(f"Upload complete: s3://{S3_BUCKET}/{s3_key}")
-    except Exception as e:
-        print(f"\nS3 upload FAILED: {e}")
+        print(f"  Upload complete: s3://{S3_BUCKET}/{s3_key}")
+        return True
+
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        msg  = e.response["Error"]["Message"]
+        print(f"\nS3 upload FAILED [{code}]: {msg}")
         print("Checklist:")
-        print(f"  - Bucket '{S3_BUCKET}' exists in region '{region}'?")
-        print(f"  - IAM user has s3:PutObject on arn:aws:s3:::{S3_BUCKET}/*?")
-        print(f"  - AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are correct?")
+        print(f"  - Does bucket '{S3_BUCKET}' exist in region '{region}'?")
+        print(f"  - IAM user has s3:PutObject on arn:aws:s3:::{S3_BUCKET}/* ?")
+        print(f"  - Are AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY correct?")
+        raise SystemExit(1)
+
+    except BotoCoreError as e:
+        print(f"\nS3 upload FAILED (BotoCoreError): {e}")
         raise SystemExit(1)
 
 
-# ---------------- REQUEST HELPERS ---------------- #
+# ═══════════════════════════════════════════════════════════
+# API FETCH
+# ═══════════════════════════════════════════════════════════
 def get_timeout_for_merchant(merchant_id):
     return LONG_TIMEOUT_MERCHANTS.get(merchant_id, DEFAULT_TIMEOUT)
 
 
-def iter_date_windows(start_date_str, end_date_str):
-    current = datetime.strptime(start_date_str, "%Y-%m-%d").date()
-    end = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+def iter_date_windows(start_str, end_str):
+    current = datetime.strptime(start_str, "%Y-%m-%d").date()
+    end     = datetime.strptime(end_str,   "%Y-%m-%d").date()
     while current <= end:
         day = current.strftime("%Y-%m-%d")
         yield day, day
         current += timedelta(days=1)
 
 
-def fetch_page_with_retry(params, merchant_id):
+def fetch_page_with_retry(params, merchant_id, hdrs):
     timeout = get_timeout_for_merchant(merchant_id)
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            response = requests.get(
-                BASE_URL, headers=headers, params=params, timeout=timeout
-            )
+            response = requests.get(BASE_URL, headers=hdrs, params=params, timeout=timeout)
+
             if response.status_code == 200:
                 try:
                     return response.json(), None
@@ -900,72 +925,57 @@ def fetch_page_with_retry(params, merchant_id):
 
             if response.status_code in NON_RETRYABLE_STATUS_CODES:
                 return None, (
-                    f"HTTP {response.status_code} (auth/permission error) for merchant {merchant_id} — "
-                    f"check your WEPOUT_TOKEN secret. Response: {response.text[:300]}"
+                    f"HTTP {response.status_code} AUTH_ERROR merchant {merchant_id} — "
+                    f"check WEPOUT_TOKEN. Body: {response.text[:300]}"
                 )
 
             if response.status_code in RETRYABLE_STATUS_CODES:
-                wait_seconds = min(2 ** (attempt - 1), 8)
-                print(
-                    f"Retryable HTTP {response.status_code} for merchant {merchant_id} "
-                    f"(attempt {attempt}/{MAX_RETRIES}). Waiting {wait_seconds}s..."
-                )
+                wait = min(2 ** (attempt - 1), 8)
+                print(f"  HTTP {response.status_code} merchant {merchant_id} attempt {attempt}/{MAX_RETRIES}, retry in {wait}s...")
                 if attempt < MAX_RETRIES:
-                    time.sleep(wait_seconds)
+                    time.sleep(wait)
                     continue
-                return None, (
-                    f"HTTP {response.status_code} for merchant {merchant_id} | "
-                    f"Response: {response.text[:500]}"
-                )
+                return None, f"HTTP {response.status_code} after {MAX_RETRIES} retries for merchant {merchant_id}"
 
-            return None, (
-                f"HTTP {response.status_code} for merchant {merchant_id} | "
-                f"Response: {response.text[:500]}"
-            )
+            return None, f"HTTP {response.status_code} merchant {merchant_id} | {response.text[:300]}"
 
         except requests.exceptions.Timeout:
-            wait_seconds = min(2 ** (attempt - 1), 8)
-            print(
-                f"Timeout for merchant {merchant_id} "
-                f"(attempt {attempt}/{MAX_RETRIES}). Waiting {wait_seconds}s..."
-            )
+            wait = min(2 ** (attempt - 1), 8)
+            print(f"  Timeout merchant {merchant_id} attempt {attempt}/{MAX_RETRIES}, retry in {wait}s...")
             if attempt < MAX_RETRIES:
-                time.sleep(wait_seconds)
+                time.sleep(wait)
                 continue
-            return None, f"Request timed out for merchant {merchant_id} after {MAX_RETRIES} attempts"
+            return None, f"Timed out merchant {merchant_id} after {MAX_RETRIES} attempts"
 
         except requests.exceptions.RequestException as e:
-            wait_seconds = min(2 ** (attempt - 1), 8)
-            print(
-                f"Request error for merchant {merchant_id} "
-                f"(attempt {attempt}/{MAX_RETRIES}): {e}"
-            )
+            wait = min(2 ** (attempt - 1), 8)
+            print(f"  Request error merchant {merchant_id} attempt {attempt}/{MAX_RETRIES}: {e}")
             if attempt < MAX_RETRIES:
-                time.sleep(wait_seconds)
+                time.sleep(wait)
                 continue
-            return None, f"Request failed for merchant {merchant_id}: {e}"
+            return None, f"Request failed merchant {merchant_id}: {e}"
 
-    return None, f"Request failed for merchant {merchant_id} after retries"
+    return None, f"Request failed merchant {merchant_id} after {MAX_RETRIES} retries"
 
 
-def fetch_merchant_data_in_range(merchant_id, range_start, range_end):
-    page = 1
+def fetch_range(merchant_id, range_start, range_end, hdrs):
+    page     = 1
     per_page = 100
     all_data = []
 
     while True:
-        print(f"Merchant {merchant_id} | Range {range_start} to {range_end} | Page {page}")
+        print(f"  Merchant {merchant_id} | {range_start} -> {range_end} | page {page}")
         params = {
-            "merchant_id": merchant_id,
-            "currency": currency,
-            "created_after": range_start,
+            "merchant_id":    merchant_id,
+            "currency":       currency,
+            "created_after":  range_start,
             "created_before": range_end,
-            "page": page,
-            "per_page": per_page,
-            "order_by": "id",
-            "sort": "asc",
+            "page":           page,
+            "per_page":       per_page,
+            "order_by":       "id",
+            "sort":           "asc",
         }
-        result, error = fetch_page_with_retry(params, merchant_id)
+        result, error = fetch_page_with_retry(params, merchant_id, hdrs)
         if error:
             return None, error
 
@@ -974,7 +984,7 @@ def fetch_merchant_data_in_range(merchant_id, range_start, range_end):
             break
 
         all_data.extend(payments)
-        print(f"Fetched {len(payments)} records")
+        print(f"    -> {len(payments)} records (total so far: {len(all_data)})")
 
         last_page = extract_last_page(result)
         if last_page is not None:
@@ -990,64 +1000,88 @@ def fetch_merchant_data_in_range(merchant_id, range_start, range_end):
     return all_data, None
 
 
-def fetch_merchant_data(merchant_id):
-    data, error = fetch_merchant_data_in_range(merchant_id, start_date, end_date)
+def fetch_merchant(merchant_id, start, end, hdrs):
+    data, error = fetch_range(merchant_id, start, end, hdrs)
+
     if error is None:
         return data
 
-    # Auth errors (401/403) will never succeed on retry — skip immediately.
-    if "auth/permission error" in (error or ""):
-        print(f"Skipping merchant {merchant_id} — permission denied (no daily fallback attempted).")
+    # Auth error — never recoverable
+    if "AUTH_ERROR" in (error or ""):
+        print(f"  x Merchant {merchant_id}: permission denied — skipping.")
         return []
 
-    print(
-        f"Broad range failed for merchant {merchant_id}: {error}\n"
-        f"Falling back to daily chunks for {merchant_id}."
-    )
-    fallback_data = []
-    for range_start, range_end in iter_date_windows(start_date, end_date):
-        daily_data, daily_error = fetch_merchant_data_in_range(merchant_id, range_start, range_end)
-        if daily_error:
-            print(f"Daily fetch failed for merchant {merchant_id} on {range_start}: {daily_error}")
+    # Other error — try day-by-day
+    print(f"  ! Merchant {merchant_id}: broad range failed -> falling back to daily chunks")
+    fallback = []
+    for rs, re_ in iter_date_windows(start, end):
+        daily, daily_err = fetch_range(merchant_id, rs, re_, hdrs)
+        if daily_err:
+            if "AUTH_ERROR" in daily_err:
+                print(f"  x Merchant {merchant_id}: auth error on {rs} — stopping daily fallback.")
+                break
+            print(f"  ! Merchant {merchant_id} {rs}: {daily_err}")
             continue
-        fallback_data.extend(daily_data)
-    return fallback_data
+        fallback.extend(daily)
+    return fallback
 
 
-# ---------------- MAIN ---------------- #
-def fetch_all_merchants():
-    final_data = []
-    merchant_counts = {}
-    for merchant_id in merchant_ids:
-        print(f"\nProcessing merchant: {merchant_id}")
-        data = fetch_merchant_data(merchant_id)
-        merchant_counts[merchant_id] = len(data)
-        final_data.extend(data)
-        print(f"Total for merchant {merchant_id}: {len(data)}")
-    return final_data, merchant_counts
-
-
+# ═══════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    if TOKEN == "PASTE_YOUR_TOKEN_HERE":
-        raise SystemExit(
-            "Set WEPOUT_TOKEN in your environment or paste the token into TOKEN before running."
+
+    # 1. Validate token — exit immediately with clear message if missing
+    validate_config()
+
+    start_date, end_date = get_date_range()
+    upload_flag = should_upload_to_s3()
+
+    print("=" * 60)
+    print(f"Date range : {start_date} -> {end_date}")
+    print(f"Merchants  : {len(merchant_ids)}")
+    print(f"Upload S3  : {upload_flag}")
+    print("=" * 60)
+
+    hdrs = build_headers()
+
+    # 2. Fetch
+    all_data        = []
+    merchant_counts = {}
+
+    for mid in merchant_ids:
+        print(f"\n-- Merchant {mid} --")
+        records = fetch_merchant(mid, start_date, end_date, hdrs)
+        merchant_counts[mid] = len(records)
+        all_data.extend(records)
+
+    # 3. Summary
+    print("\n" + "=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+    for mid in merchant_ids:
+        count = merchant_counts.get(mid, 0)
+        note  = "" if count > 0 else "  <- no data / permission denied"
+        print(f"  Merchant {mid:>4}: {count:>6} records{note}")
+    print(f"\n  TOTAL: {len(all_data)} records  ({start_date} to {end_date})")
+    print("=" * 60)
+
+    if len(all_data) == 0:
+        print(
+            "\n  WARNING: Zero records fetched.\n"
+            "  Most likely cause: WEPOUT_TOKEN is expired or invalid.\n"
+            "  Action: GitHub -> Settings -> Secrets -> WEPOUT_TOKEN\n"
+            "          Refresh the token from your WEpayout dashboard.\n"
         )
 
-    data, merchant_counts = fetch_all_merchants()
+    # 4. Write CSV (always, even if empty)
+    csv_path = os.path.abspath("payments_full_data.csv")
+    print(f"\nWriting CSV -> {csv_path}")
+    save_csv(all_data, csv_path)
 
-    print("\nSummary\n")
-    for mid in merchant_ids:
-        print(f"Merchant {mid}: {merchant_counts.get(mid, 0)}")
-    print(f"\nTotal Records (Date Filtered): {len(data)}")
-
-    # Use an absolute path so both the CSV write and S3 upload
-    # resolve to the same file regardless of working directory.
-    csv_filename = os.path.abspath("payments_full_data.csv")
-    print(f"\nWriting CSV to: {csv_filename}")
-    save_mapped_csv_with_extras(data, csv_filename)
-
-    if should_upload_to_s3():
-        upload_csv_to_s3(csv_filename, end_date)
+    # 5. S3 upload
+    if upload_flag:
+        upload_csv_to_s3(csv_path, end_date)
     else:
         print("\nS3 upload skipped (upload_s3=false).")
 
