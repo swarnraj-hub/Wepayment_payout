@@ -45,9 +45,11 @@ print(f"\nDate Filter Applied: {start_date} to {end_date}\n")
 
 # ---------------- HEADERS ---------------- #
 headers = {
-    "Authorization": f"Bearer {TOKEN}",
-    "Accept": "application/json",
-}
+        "Authorization": f"Bearer {WEPOUT_TOKEN}",
+        "Accept": "application/json",             
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0"                
+    }
 
 DEFAULT_TIMEOUT = 60
 LONG_TIMEOUT_MERCHANTS = {
