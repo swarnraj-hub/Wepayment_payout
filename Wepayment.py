@@ -819,16 +819,38 @@ AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
 
 
 def upload_csv_to_s3(local_path, date_str):
+    # --- Pre-flight: catch missing secrets before boto3 gives a cryptic error ---
+    missing = [name for name, val in [
+        ("AWS_ACCESS_KEY_ID",     AWS_ACCESS_KEY_ID),
+        ("AWS_SECRET_ACCESS_KEY", AWS_SECRET_ACCESS_KEY),
+        ("AWS_REGION",            AWS_REGION),
+        ("S3_BUCKET",             S3_BUCKET),
+    ] if not val]
+    if missing:
+        print(f"\nS3 upload SKIPPED — missing env vars: {', '.join(missing)}")
+        return
+
+    # Absolute path so boto3 always finds the file regardless of working directory.
+    abs_path = os.path.abspath(local_path)
+    if not os.path.exists(abs_path):
+        print(f"\nS3 upload SKIPPED — file not found at: {abs_path}")
+        return
+
     s3_key = S3_KEY or f"{S3_PREFIX}/{date_str}/payments_full_data.csv"
-    s3 = boto3.client(
-        "s3",
-        region_name=AWS_REGION,
-        aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-    )
-    print(f"\nUploading to s3://{S3_BUCKET}/{s3_key} ...")
-    s3.upload_file(local_path, S3_BUCKET, s3_key)
-    print(f"Upload complete: s3://{S3_BUCKET}/{s3_key}")
+    print(f"\nUploading {abs_path} -> s3://{S3_BUCKET}/{s3_key} (region: {AWS_REGION}) ...")
+    try:
+        s3 = boto3.client(
+            "s3",
+            region_name=AWS_REGION,
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        )
+        s3.upload_file(abs_path, S3_BUCKET, s3_key)
+        print(f"Upload complete: s3://{S3_BUCKET}/{s3_key}")
+    except Exception as e:
+        print(f"\nS3 upload FAILED: {e}")
+        print("Check: bucket name, region, IAM permissions (s3:PutObject), and secret values.")
+        raise SystemExit(1)
 
 
 # ---------------- REQUEST HELPERS ---------------- #
@@ -1000,12 +1022,15 @@ if __name__ == "__main__":
         print(f"Merchant {mid}: {merchant_counts.get(mid, 0)}")
     print(f"\nTotal Records (Date Filtered): {len(data)}")
 
-    csv_filename = "payments_full_data.csv"
+    # Use an absolute path so both the CSV write and S3 upload
+    # resolve to the same file regardless of working directory.
+    csv_filename = os.path.abspath("payments_full_data.csv")
+    print(f"\nWriting CSV to: {csv_filename}")
     save_mapped_csv_with_extras(data, csv_filename)
 
-    # FIX: conditionally upload based on the upload_s3 flag
     if should_upload_to_s3():
         upload_csv_to_s3(csv_filename, end_date)
     else:
         print("\nS3 upload skipped (upload_s3=false).")
+
 
