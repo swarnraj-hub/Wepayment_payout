@@ -28,13 +28,13 @@ MAX_RETRIES                = 6
 RETRYABLE_STATUS_CODES     = {429, 500, 502, 503, 504}
 NON_RETRYABLE_STATUS_CODES = {401, 403}
 
-# S3 — NO hardcoded defaults for secrets (empty string = not set)
-S3_BUCKET             = os.getenv("S3_BUCKET", "")
-S3_PREFIX             = os.getenv("S3_PREFIX", "wepayments/payout/raw_daily")
-S3_KEY                = os.getenv("S3_KEY", "")
-AWS_REGION            = os.getenv("AWS_REGION", "")
-AWS_ACCESS_KEY_ID     = os.getenv("AWS_ACCESS_KEY_ID", "")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+# S3 config — use `or` so empty-string secrets from GitHub Actions fall back to defaults
+S3_BUCKET             = os.getenv("S3_BUCKET", "")          or ""
+S3_PREFIX             = os.getenv("S3_PREFIX", "")          or "wepayments/payout/raw_daily"
+S3_KEY                = os.getenv("S3_KEY", "")             or ""
+AWS_REGION            = os.getenv("AWS_REGION", "")         or ""
+AWS_ACCESS_KEY_ID     = os.getenv("AWS_ACCESS_KEY_ID", "")  or ""
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "") or ""
 
 _AWS_REGION_RE = re.compile(r"^[a-z]+-[a-z]+-[0-9]+$")
 
