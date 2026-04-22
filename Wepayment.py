@@ -283,7 +283,13 @@ def upload_csv_to_s3(local_path, date_str):
         return False
 
     region = AWS_REGION.strip()
-    s3_key = S3_KEY or f"{S3_PREFIX}/{date_str}/payments_full_data.csv"
+
+    # ✅ Your S3 path logic
+    s3_key = f"wepayments/payout/raw_daily/payout-export-{date_str}.csv"
+
+    # ✅ ADD THIS LINE HERE
+    print(f"FINAL S3 PATH → s3://{S3_BUCKET}/{s3_key}")
+
     print(f"\nUploading to s3://{S3_BUCKET}/{s3_key}  (region: {region}) ...")
 
     try:
