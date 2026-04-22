@@ -22,9 +22,9 @@ TOKEN    = os.getenv("WEPOUT_TOKEN", "")
 currency = "BRL"
 BASE_URL = "https://api.wepayout.com.br/v1/payout/payments"
 
-DEFAULT_TIMEOUT            = 60
-LONG_TIMEOUT_MERCHANTS     = {585: 180}
-MAX_RETRIES                = 6
+DEFAULT_TIMEOUT            = 180
+LONG_TIMEOUT_MERCHANTS     = {585: 600}
+MAX_RETRIES                = 8
 RETRYABLE_STATUS_CODES     = {429, 500, 502, 503, 504}
 NON_RETRYABLE_STATUS_CODES = {401, 403}
 
